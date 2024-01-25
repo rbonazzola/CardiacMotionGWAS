@@ -22,4 +22,9 @@ This folder needs to have a subfolder called `summaries`, with one file per phen
 >>> results.get_lead_snps()
 # Returns a dataframe with one region per row, with details about the lead SNP in that region
 
+>>> results.loci_summary()
+# Returns a dataframe with (run, variable_type, region) as key and (count, min_P) as values.
+
+>>> results.show_counts()
+# Returns a dataframe with (region, variable_type) as key and (count, min_P) as values.
 ```
