@@ -1,15 +1,16 @@
 # GWAS on cardiac motion phenotypes
 
-### Class `EnsemblResults`
+### Class `EnsembleGWASResults`
 
-Initialize an `EnsemblResults` object by passing it a path to GWAS results. 
+Initialize an `EnsembleGWASResults` object by passing it a path to GWAS results. 
 This folder needs to have a subfolder called `summaries`, with one file per phenotype, detailing the best association for each genomic region (one region per row).
 
 ##### Usage
 
 ```python
+>>> from cardiac_motion_upe.EnsembleResults
 >>> gwas_dir = "GWAS_results"
->>> results = EnsembleResults(gwas_dir)
+>>> results = EnsembleGWASResults(gwas_dir)
 
 >>> results.get_significant_regions()
 # Returns, e.g., ['chr4_77', 'chr17_27', 'chr22_7', 'chr17_40', 'chr12_67', 'chr15_35', ...]
