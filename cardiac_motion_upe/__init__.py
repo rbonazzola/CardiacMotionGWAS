@@ -8,6 +8,14 @@ GWAS_RESULTS_DIR = os.getenv("GWAS_RESULTS_DIR", os.path.join(BASE_DIR, "results
 
 assert os.path.exists(GWAS_RESULTS_DIR), f"{GWAS_RESULTS_DIR=} does not exist. You can set an environment variable with this name containing the correct path."
 
-from run_helpers import (
-    EnsembleResults    
+import logging
+LOGLEVEL = os.getenv("LOGLEVEL", "INFO")
+logging.basicConfig(level=LOGLEVEL)
+
+from ensemble_helpers import (
+    EnsembleGWASResults    
+)
+
+from loci_helpers import (
+    fetch_loci_mapping
 )

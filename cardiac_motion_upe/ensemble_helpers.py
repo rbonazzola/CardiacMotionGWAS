@@ -35,20 +35,61 @@ from loci_helpers import (
 import gwas_pipeline
 
 
+def generate_loci_summary(assocs_df, 
+    only_dynamic=False, 
+    only_static=False,     
+    # chamber=None, 
+    p_threshold=5e-8, 
+    other_columns=['chamber']):
+
+    assocs_df = assocs_df.copy()
+
+    # assert chamber in { None } | EnsembleGWASResults.possible_chambers, f"Chamber not valid, got {chamber}."
+    assert not (only_dynamic and only_static), "At most one of only_dynamic or only_static can be True."
+        
+    GROUPBY_COLS = ["region", "run", "variable_type"]
+    
+    # if "run" in assocs_df.columns:   
+        # GROUPBY_COLS.append("run")
+    # if "variable_type" in assocs_df.columns: 
+        # GROUPBY_COLS.append("variable_type")
+    GROUPBY_COLS.extend(other_columns)
+        
+    loci_summary_df = ( assocs_df
+        .query("P < @p_threshold")
+        .reset_index()
+        .groupby(by=GROUPBY_COLS)
+        .aggregate({"CHR": "count", "P": "min"}).rename({"CHR": "count", "P": "min_P"}, axis=1)
+        .reset_index()
+        .sort_values("count", ascending=False)
+        .sort_values("min_P", ascending=True) ) 
+    
+    if "variable_type" in loci_summary_df.columns:
+        if only_dynamic:
+            loci_summary_df.query("variable_type == 'dynamic'")  
+        elif only_static:
+            loci_summary_df.query("variable_type == 'static'")
+
+    # Filter regions that are duplicated (according to the spreadsheet)
+    loci_summary_df = EnsembleGWASResults.filter_valid_regions(loci_summary_df)
+    # loci_summary_df.loc[[x in EnsembleGWASResults.valid_regions for x in loci_summary_df.index.get_level_values("region")]]
+    
+    return loci_summary_df
+
+
 class EnsembleGWASResults:
 
     runs_df = Run.get_runs()
-
+    
     regions_df          = get_ld_indep_regions()
     latent_dim_c_dict   = runs_df[["params.latent_dim_c"]].to_dict()['params.latent_dim_c']
     
-    print(latent_dim_c_dict)
     rec_ratio_per_run   = runs_df[["metrics.val_rec_ratio_to_time_mean"]].to_dict()['metrics.val_rec_ratio_to_time_mean']
     msd_static_per_run  = runs_df[["metrics.val_recon_loss_c"]].to_dict()['metrics.val_recon_loss_c']
     msd_dynamic_per_run = runs_df[["metrics.val_recon_loss_s"]].to_dict()['metrics.val_recon_loss_s']
 
     run_to_expid_dict   = runs_df.reset_index(drop=True).set_index('run_id')["experiment_id"].to_dict()
-
+    
     expid_to_partition_mapping = { str(k): v for k, v in Run.expid_to_partition_mapping.items() }
 
     # TODO: THIS IS A COMMON PROBLEM, SOLVE IT IN SOME ELEGANT WAY
@@ -65,10 +106,13 @@ class EnsembleGWASResults:
     
     possible_chambers = { "BV", "LV", "RV", "LA", "RA", "AO" }
 
-    def __init__(self, root_dir, expid=None, top_n_runs_per_chamber=None, from_cached=False, cache=None):
+    RELEVANT_RUN_HPARAMS = [ "params.latent_dim_c", "params.latent_dim_s", "params.dataset_static_representative", "params.w_kl" ]
+    RELEVANT_RUN_METRICS = [ "metrics.val_recon_loss_c", "metrics.val_recon_loss_s", "metrics.val_rec_ratio_to_time_mean" ]
+
+
+    def __init__(self, root_dir, expid=None, from_cached=False, cache=None):
         
         self._rootdir = root_dir        
-        self._top_n_runs_per_chamber = top_n_runs_per_chamber        
         self._cache_file = f"{self._rootdir}/region_assocs_df.pkl"
         self._collect_summaries(from_cached=from_cached, cache=cache)      
         
@@ -89,9 +133,8 @@ class EnsembleGWASResults:
     @staticmethod
     def process_aha_summary_file(phenotype, file):
         magnitude, aha_segment = "_".join(phenotype.split("_")[:-1]), phenotype.split("_")[-1]
-        chamber = "LV"
         logging.debug(f"Magnitude: {magnitude} / AHA segment: {aha_segment}")
-        assocs_df = pd.read_csv(file).assign(chamber=chamber, magnitude=magnitude, aha_segment=aha_segment, pheno=phenotype)
+        assocs_df = pd.read_csv(file).assign(chamber="LV", magnitude=magnitude, aha_segment=aha_segment, pheno=phenotype)
         return assocs_df
 
     
@@ -119,8 +162,10 @@ class EnsembleGWASResults:
 
         return assocs_df
 
+
     @staticmethod
     def process_traditional_phenotype_summary_file(phenotype, file):
+
         logging.debug(f"Phenotype: {phenotype}")
                     
         for possible_chamber in ["BV", "LV", "RV", "LA", "RA"]:
@@ -129,6 +174,18 @@ class EnsembleGWASResults:
                 break
         assocs_df = pd.read_csv(file).assign(pheno=phenotype, chamber=chamber)
         return assocs_df
+
+
+    @staticmethod
+    def process_other_phenotype_summary_file(phenotype, file):
+
+        run_id, pheno = pheno.split("_")[0], "_".join(pheno.split("_")[1:])
+        chamber = EnsembleGWASResults.run_to_chamber_dict[run_id]
+        logging.debug(f"Run: {run_id} / phenotype: {pheno}")
+        assocs_df = pd.read_csv(file).assign(run=run_id, pheno=pheno, chamber=chamber)
+        
+        return assocs_df
+    
 
     @staticmethod
     def _type_of_phenotype(phenotype):
@@ -142,6 +199,66 @@ class EnsembleGWASResults:
             return "other"
         
 
+    @staticmethod
+    def process_summary_file(file):
+
+        phenotype = EnsembleGWASResults.get_phenotype_name_summary_files(file)
+        
+        type_of_phenotype = EnsembleGWASResults._type_of_phenotype(phenotype)
+        
+        if type_of_phenotype == "latent":
+            assocs_df = EnsembleGWASResults.process_latent_variable_summary_file(phenotype, file)
+        elif type_of_phenotype == "aha":
+            assocs_df = EnsembleGWASResults.process_aha_summary_file(phenotype, file)
+        elif type_of_phenotype == "traditional":
+            assocs_df = EnsembleGWASResults.process_traditional_phenotype_summary_file(phenotype, file)
+        elif type_of_phenotype == "other":
+            assocs_df = EnsembleGWASResults.process_other_phenotype_summary_file(phenotype, file)
+        
+        return assocs_df
+    
+
+    @staticmethod
+    def add_variable_type(df):
+        
+        # This is a way to determine whether we are dealing with latent variables
+        assert "pheno" in df.columns, "Column 'pheno' not found in the DataFrame. Available columns are {df.columns}"
+
+        if any(df.pheno.apply(lambda x: "z0" in x)):
+            logging.info(f"Assigning dynamic/static label to phenotypes...")
+            try:
+                df["variable_type"] = df.apply(EnsembleGWASResults._get_variable_type, axis=1)
+            except Exception as e:
+                logging.error(e)        
+        return df
+    
+
+    @staticmethod
+    def add_is_variational_column(df):
+        
+        # This is a way to determine whether we are dealing with latent variables
+        assert 'params.w_kl' in df.columns, f"Column 'params.w_kl' not found in the DataFrame. Available columns are {df.columns}"
+
+        return df.assign(is_variational=lambda df: df['params.w_kl'].astype(float) > 0)
+
+
+    def filter_results(self, query, inplace=True):       
+        if inplace:
+            self.region_assocs_df = self.region_assocs_df.query(query)
+            return self.region_assocs_df
+        else:
+            return self.region_assocs_df.query(query)
+        
+
+    def count_runs(self):
+        return ( self.region_assocs_df.
+            drop_duplicates(subset=['run'], keep='first')[["chamber", "static_representative", "is_variational"]].
+            value_counts().
+            to_frame().reset_index().
+            pivot(columns=["static_representative", "is_variational"], index="chamber", values="count").
+            fillna(0).astype(int).
+            rename_axis(columns=["static representative", "is variational?"]) )
+    
 
     def _collect_summaries(self, from_cached, cache):
         
@@ -152,85 +269,63 @@ class EnsembleGWASResults:
         if from_cached and os.path.exists(self._cache_file):
             logging.info(f"Loading cached results from {self._cache_file}")
             self.region_assocs_df = pd.read_pickle(f"{self._cache_file}")
-
         else:     
-
             if not os.path.exists(self._cache_file):
                 logging.info(f"File {self._cache_file} does not exist. Results will be cached.")
                 cache = True
 
-            summary_files = EnsembleGWASResults.find_summary_files(self._rootdir)
-
             zvar_gwas_assocs = []
-            for file in tqdm(summary_files):            
-                
-                pheno = EnsembleGWASResults.get_phenotype_name_summary_files(file)
-                
-                type_of_phenotype = EnsembleGWASResults._type_of_phenotype(pheno)
-
-                if type_of_phenotype == "latent":
-                    assocs_df = EnsembleGWASResults.process_latent_variable_summary_file(pheno, file)                    
-                elif type_of_phenotype == "aha":
-                    assocs_df = EnsembleGWASResults.process_aha_summary_file(pheno, file)                                     
-                elif type_of_phenotype == "traditional":
-                    assocs_df = EnsembleGWASResults.process_traditional_phenotype_summary_file(pheno, file)
-                elif type_of_phenotype == "other":                
-                    run_id, pheno = pheno.split("_")[0], "_".join(pheno.split("_")[1:])
-                    chamber = EnsembleGWASResults.run_to_chamber_dict[run_id]
-                    logging.debug(f"Run: {run_id} / phenotype: {pheno}")
-                    assocs_df = pd.read_csv(file).assign(run=run_id, pheno=pheno, chamber=chamber)
-                
+            for file in tqdm(EnsembleGWASResults.find_summary_files(self._rootdir)):            
+                assocs_df = EnsembleGWASResults.process_summary_file(file)                
                 if assocs_df is not None:
                     zvar_gwas_assocs.append(assocs_df)
                 
             logging.info(f"Collected GWAS summary data for {len(zvar_gwas_assocs)} phenotypes.")
     
-            logging.info(f"Concatenating...")
-            region_assocs_df = pd.concat(zvar_gwas_assocs)
-            region_assocs_df = region_assocs_df.set_index(["pheno", "region"])
-            region_assocs_df = region_assocs_df.reset_index()
-     
-            # This is a way to determine whether we are dealing with latent variables
-            if any(region_assocs_df.pheno.apply(lambda x: "z0" in x)):
-                logging.info(f"Assigning dynamic/static label to phenotypes...")
-                try:
-                    region_assocs_df["variable_type"] = region_assocs_df.apply(self._get_variable_type, axis=1)
-                except Exception as e:
-                    logging.error(e)
+            logging.debug(f"Concatenating...")
+            region_assocs_df = pd.concat(zvar_gwas_assocs) 
+            region_assocs_df = EnsembleGWASResults.add_variable_type(region_assocs_df)            
+
+            run_additional_info = self.runs_df[EnsembleGWASResults.RELEVANT_RUN_HPARAMS + EnsembleGWASResults.RELEVANT_RUN_METRICS]
             
-            if "run" in region_assocs_df.columns:
-                region_assocs_df["msd_static"]  = region_assocs_df.run.apply(lambda x: EnsembleGWASResults.msd_static_per_run.get(x, np.nan))
-                region_assocs_df["msd_dynamic"] = region_assocs_df.run.apply(lambda x: EnsembleGWASResults.msd_dynamic_per_run.get(x, np.nan))
-                region_assocs_df["rec_ratio"]   = region_assocs_df.run.apply(lambda x: EnsembleGWASResults.rec_ratio_per_run.get(x, np.nan))
-            
+            region_assocs_df = pd.merge(region_assocs_df, run_additional_info, left_on='run', right_on='run_id')
+            region_assocs_df = EnsembleGWASResults.add_is_variational_column(region_assocs_df)
+
+            region_assocs_df = region_assocs_df.rename({
+                "params.dataset_static_representative": "static_representative",
+                "metrics.val_recon_loss_c": "msd_static",
+                "metrics.val_recon_loss_s": "msd_dynamic",
+                "metrics.val_rec_ratio_to_time_mean": "rec_ratio"
+            }, axis=1)
+
             if cache:
                 logging.info(f"Caching results to {self._rootdir}/region_assocs_df.pkl")
                 region_assocs_df.to_pickle(f"{self._rootdir}/region_assocs_df.pkl")
     
             self.region_assocs_df = region_assocs_df
-         
-        if self._top_n_runs_per_chamber is not None:
-            logging.info(f"Only the best (at most) {self._top_n_runs_per_chamber} runs per chamber with the best performance will be kept. Filtering...")
-            self.region_assocs_df = self._keep_top_n_per_chamber(n=self._top_n_runs_per_chamber)
-    
+            return self.region_assocs_df
 
-    def _keep_top_n_per_chamber(self, n):
+             
+    def keep_top_n_per_chamber(self, n, inplace=False):
         
         rec_losses = []
         
         for chamber in self.region_assocs_df.chamber.unique():
-            results_for_chamber = self.region_assocs_df[self.region_assocs_df.chamber == chamber]
+            results_for_chamber = self.region_assocs_df. query("chamber == @chamber")
             unique_values = results_for_chamber.msd_dynamic.unique()[:n]
             logging.info(f"Chamber {chamber}: Keeping {len(unique_values)} runs with the best performance.")
             rec_losses.extend(unique_values)
         
-        rec_losses = set(rec_losses)
-        self.region_assocs_df = self.region_assocs_df[self.region_assocs_df.rec_ratio.apply(lambda x: x in rec_ratios)]
+        # rec_losses = set(rec_losses)
+        if inplace:
+            logging.info(f"Only the best (at most) {n} runs per chamber with the best performance will be kept. Filtering...")
+            self.region_assocs_df = self.region_assocs_df[self.region_assocs_df.msd_dynamic.apply(lambda x: x in rec_losses)]
+        else:            
+            return self.region_assocs_df[self.region_assocs_df.msd_dynamic.apply(lambda x: x in rec_losses)]
 
-        return self.region_assocs_df
 
-
-    def _get_variable_type(self, row):
+    @staticmethod
+    def _get_variable_type(row):
                 
         n_static_variables = int(EnsembleGWASResults.latent_dim_c_dict.get(row.run, -1))
         if n_static_variables == -1:
@@ -240,56 +335,36 @@ class EnsembleGWASResults:
         return "static" if zvar < n_static_variables else "dynamic"
 
 
-    def loci_summary(self, only_dynamic=False, only_static=False, per_chamber=False, chamber=None, p_threshold=5e-8):
+    @staticmethod
+    def filter_valid_regions(df):
+        print(f"{df.shape=}")
+        if "region" in df.columns:
+            df_filtered = df.where(df.region.isin(EnsembleGWASResults.valid_regions))
+            return df_filtered
+        # return df.loc[[x in EnsembleGWASResults.valid_regions for x in df.index.get_level_values("region")]]
+
+
+    def loci_count(self, p_threshold=5e-8, attributes=['chamber']):
         
-        assert chamber in { None } | EnsembleGWASResults.possible_chambers, f"Chamber not valid, got {chamber}."
+        loci_summary_df = generate_loci_summary(self.region_assocs_df, p_threshold=p_threshold) # self.loci_summary(p_threshold=p_threshold, )
         
-        GROUPBY_COLS = ["region"]
-        if "run" in self.region_assocs_df.columns:
-            GROUPBY_COLS.append("run")
-        if "variable_type" in self.region_assocs_df.columns: 
-            GROUPBY_COLS.append("variable_type")
-        if per_chamber:                                      
-            GROUPBY_COLS.append("chamber")
-            
-        loci_summary_df = ( self.region_assocs_df.query("P < @p_threshold")
-            .reset_index()
-            .groupby(by=GROUPBY_COLS)
-            .aggregate({"CHR": "count", "P": "min"}).rename({"CHR": "count", "P": "min_P"}, axis=1)
-            .sort_values("count", ascending=False)
-            .sort_values("min_P", ascending=True))            
+        assert all([attributes in loci_summary_df.columns for attributes in attributes]), f"""
+            Columns {set(attributes) - set(loci_summary_df.columns)} not found in the DataFrame.
+            Columns are {loci_summary_df.columns.to_list()}.
+        """
+
+        ( GROUPBY_COLS := ["region", "variable_type"] ).extend( attributes )
+
+        assert set(GROUPBY_COLS).issubset(loci_summary_df.columns), f"""
+            Columns {set(GROUPBY_COLS) - set(loci_summary_df.columns)} not found in the DataFrame.
+            Columns are {loci_summary_df.columns.to_list()}.
+        """ 
         
-        if "variable_type" in loci_summary_df.columns:
-            if only_dynamic:
-                loci_summary_df = loci_summary_df[loci_summary_df.index.get_level_values("variable_type") == "dynamic"]
-            elif only_static:
-                loci_summary_df = loci_summary_df[loci_summary_df.index.get_level_values("variable_type") == "static"]
-        
-        # Filter regions that are duplicated (according to the spreadsheet)
-        loci_summary_df = loci_summary_df.loc[[x in EnsembleGWASResults.valid_regions for x in loci_summary_df.index.get_level_values("region")]]
-        
-        return loci_summary_df
-    
-    
-    def loci_count(self, per_chamber=False, p_threshold=5e-8):
-        
-        loci_summary_df = self.loci_summary(per_chamber=per_chamber, p_threshold=p_threshold)
-        
-        GROUPBY_COLS = ["region", "variable_type"]
-        
-        if per_chamber:
-            GROUPBY_COLS.append("chamber")
-        
-        try:
-            loci_count_df = loci_summary_df.groupby(GROUPBY_COLS)
-        except KeyError as e:
-            print(e)
-            loci_count_df = loci_summary_df.groupby(["region"])
-        
-        loci_count_df = loci_count_df.\
-            aggregate({"count":"count", "min_P": "min"}).\
-            rename({"CHR":"count", "P":"min_P"}, axis=1).\
-            sort_values("count", ascending=False)
+        loci_count_df = ( loci_summary_df.
+            groupby(GROUPBY_COLS).
+            aggregate({"count":"count", "min_P": "min"}).
+            rename({"CHR":"count", "P":"min_P"}, axis=1).
+            sort_values("count", ascending=False) )
             
         return loci_count_df
     
@@ -357,47 +432,80 @@ class EnsembleGWASResults:
         significant_regions = list(set(significant_regions))
         return significant_regions
     
-    
-    def create_count_table_tex(self, tex_file=None):
-    
-        '''
-          counts_df: 
-          tex_file:
-        '''
-        
-        regions = self.get_significant_regions()
-        snp_data = self._snp_data()
-        counts_df = self.loci_count()
-        
-        counts_df = counts_df.loc[regions]
-        counts_df.min_P = [f"${str(round(float(x[0]), 1))} \times 10^{{{x[1]}}}$" for x in counts_df.min_P.astype(str).str.split("e")]
-        counts_df = counts_df.reset_index()
-        counts_df["candidate gene"] = counts_df.region.apply(lambda region: self.loci_mapping_df.loc[region, "candidate_gene"])
-        counts_df["chr."] = counts_df.region.apply(lambda region: regions_df.loc[region, "chr"])
-        
-        counts_df = counts_df.merge(snp_data, on="region")
-        counts_df["region"] = counts_df.region.apply(lambda region: f'{regions_df.loc[region, "start"]}-{regions_df.loc[region, "stop"]}')
-        counts_df = counts_df.sort_values("count", ascending=False)
-        counts_df = counts_df[["chr.", "region", "candidate gene", "count", "min_P", "SNP", "a_0", "a_1", "AF", "BETA", "SE"]]
-        counts_df = counts_df.rename({"min_P": "min. $p$-value", "a_0": "NEA", "a_1": "EA", "AF": "EAF"}, axis=1)
-        
-        table_code = counts_df.to_latex(escape=False, index=False)
-        # table_code = counts_df.style.to_latex()
-    
-        table_code = table_code.replace("_", "\_")
 
+    @classmethod
+    def create_count_table_tex(counts_df, tex_file=None):
+        
+        '''
+          Generates a LaTeX table for significant loci.
+          tex_file: Optional filename to save the LaTeX table.
+        '''
+        
+        assert isinstance(counts_df, pd.DataFrame), "counts_df must be a pandas DataFrame"
+        if tex_file is not None:
+            assert isinstance(tex_file, str), "tex_file must be a string or None"
+
+        assert "min_P" in counts_df.columns, "'min_P' column is missing"
+
+        regions   = self.get_significant_regions()
+        snp_data  = self._snp_data()
+    
+        build_pvalue_str = lambda x: f"${round(float(x[0]), 1)} \\times 10^{{{x[1]}}}$"
+        build_region_str = lambda region: f'{EnsembleGWASResults.regions_df.loc[region, "start"]}-{EnsembleGWASResults.regions_df.loc[region, "stop"]}'
+        build_eaf_pctg_str    = lambda x: f"{(100*x):.1f}"
+        region_to_candidate_gene = lambda gene: self.loci_mapping_df.loc[gene, "candidate_gene"]
+        chromosome_from_region = lambda region: EnsembleGWASResults.regions_df.loc[region, "chr"] 
+
+        counts_df = counts_df.loc[regions]
+        counts_df = counts_df.assign(min_P=counts_df["min_P"].astype(str).str.split("e").apply(build_pvalue_str))
+        counts_df = counts_df.reset_index()
+        counts_df = counts_df.assign(candidate_gene=counts_df["region"].map(region_to_candidate_gene))
+        counts_df = counts_df.assign(chr= counts_df.region.map(chromosome_from_region))
+        counts_df = counts_df.merge(snp_data, on="region")
+        counts_df = counts_df.assign(region=counts_df["region"].map(build_region_str))
+        counts_df = counts_df.sort_values("count", ascending=False)
+
+        counts_df = counts_df[["chr", "region", "candidate gene", "count", "min_P", "SNP", "a_0", "a_1", "AF", "BETA", "SE"]]
+        counts_df = counts_df.rename(columns={"chr": "chr.", "min_P": "min. $p$-value", "a_0": "NEA", "a_1": "EA", "AF": "EAF"})
+        counts_df = counts_df.assign(EAF=counts_df.EAF.apply(build_eaf_str))
+    
+        assert not counts_df.empty, "counts_df is empty after filtering"        
+        assert hasattr(cls, 'loci_mapping_df'), "'loci_mapping_df' attribute is missing in the class"
+
+        scale_beta = counts_df["BETA"].abs().between(0.01, 0.2).all()
+    
+        if scale_beta:
+            counts_df["BETA"] = (counts_df["BETA"] * 100).round(3)
+            counts_df["SE"] = (counts_df["SE"] * 100).round(3)
+            beta_header = r"$\hat{\beta} \pm \text{se}(\hat{\beta})(\times 100)$ "
+        else:
+            counts_df["BETA"] = counts_df["BETA"].round(3)
+            counts_df["SE"] = counts_df["SE"].round(3)
+            beta_header = r"$\hat{\beta} \pm \text{se}(\hat{\beta})$"
+    
+        counts_df["BETA_SE"] = counts_df.apply(lambda row: f"${row['BETA']} \pm {row['SE']}$", axis=1)
+        counts_df = counts_df.drop(columns=["BETA", "SE"])
+    
+        table_code = counts_df.to_latex(
+            escape=False,
+            index=False,
+            column_format="rllrllllr",
+            caption="GWAS Results"
+        )
+    
+        table_code = table_code.replace("_", "\\_").replace("BETA\_SE", beta_header)
+    
         if tex_file is not None:
             print(f"Creating output file in {tex_file}")
-            with open(tex_file, "wt") as table_f:    
+            with open(tex_file, "wt") as table_f:
                 table_f.write(table_code)
-        
-        else: 
-            return table_code
-        
+    
+        return table_code
+
     
     def _snp_data(self):
         
-        region_assocs_df = self.region_assocs_df
+        region_assocs_df = self.region_assocs_df.copy()
         region_assocs_df = region_assocs_df.loc[~region_assocs_df.sort_values("SNP").duplicated("SNP")]
         signif_regions = set(self.get_significant_regions())
         region_assocs_df = region_assocs_df.reset_index()
@@ -418,6 +526,8 @@ class EnsembleGWASResults:
             return by_variable_type_df.sort_values("dynamic")
         else:
             return by_variable_type_df.sort_values("static")
+        
+        return by_variable_type_df
     
     
     def get_lead_snps(self):
@@ -431,97 +541,30 @@ class EnsembleGWASResults:
             sort_values(["CHR", "BP"])
 
 
-    def get_counts_per_chamber(self, p_threshold=5e-8):
+    def get_counts_per_attribute(self, p_threshold=5e-8, attributes=["variable_type"]):
         
-        COL_ORDER = [(variable_type, chamber) for variable_type in ["dynamic", "static"] for chamber in ["BV", "LV", "RV", "LA", "RA"]]
+        COL_ORDER = [(variable_type, chamber) for variable_type in ["dynamic", "static"] for chamber in ["BV", "LV", "RV", "LA", "RA"]]        
 
-        counts_per_chamber = self.loci_count(per_chamber=True, p_threshold=p_threshold).\
+        counts_by_attribute = self.loci_count(p_threshold=p_threshold).\
             reset_index().\
-            pivot(index="region", values="count", columns=["variable_type", "chamber"]).\
-            fillna(0).astype(int)[COL_ORDER]
+            pivot(index="region", values="count", columns=attributes).\
+            fillna(0).astype(int)
         
-        ordered_by_dynamic = counts_per_chamber["dynamic"].sum(axis=1).sort_values(ascending=False).index
-        total_counts_dynamic = counts_per_chamber.loc[ordered_by_dynamic]["dynamic"].sum(axis=1)
-        total_counts_static = counts_per_chamber.loc[ordered_by_dynamic]["static"].sum(axis=1)
+        COL_ORDER = [ indices for indices in COL_ORDER if indices in counts_by_attribute.columns ]
+        counts_by_attribute = counts_by_attribute[COL_ORDER]
+        
+        ordered_by_dynamic   = counts_by_attribute["dynamic"].sum(axis=1).sort_values(ascending=False).index
+        total_counts_dynamic = counts_by_attribute.loc[ordered_by_dynamic]["dynamic"].sum(axis=1)
+        total_counts_static  = counts_by_attribute.loc[ordered_by_dynamic]["static"].sum(axis=1)
         
         ratio_dyn_to_stat = (total_counts_dynamic - total_counts_static) / (total_counts_dynamic + total_counts_static)
         possible_order = (ratio_dyn_to_stat[(total_counts_dynamic+total_counts_static) > 3]).sort_values(ascending=False).index
         
-        counts_per_chamber = counts_per_chamber.loc[possible_order]
-        counts_per_chamber.index = [self.loci_mapping_df.loc[region, "candidate_gene"] for region in counts_per_chamber.index]
+        counts_by_attribute = counts_by_attribute.loc[possible_order]
+        counts_by_attribute.index = [self.loci_mapping_df.loc[region, "candidate_gene"] for region in counts_by_attribute.index]
         
-        return counts_per_chamber
+        return counts_by_attribute
 
 
-# def get_significant_loci(
-#     runs_df,
-#     experiment_id, run_id, 
-#     p_threshold=5e-8, 
-#     client=mlflow.tracking.MlflowClient()
-# ) -> pd.DataFrame:
-#     
-#     '''    
-#     Returns a DataFrame with the loci that have a stronger p-value than a given threshold
-#     '''
-#     
-#     def get_phenoname(path):        
-#         filename = os.path.basename(path)
-#         phenoname = filename.split("__")[0]
-#         return phenoname
-#         
-#     run_info = runs_df.loc[(experiment_id, run_id)].to_dict()
-#     artifact_uri = run_info["artifact_uri"].replace("file://", "")    
-#            
-#     gwas_dir_summaries = os.path.join(artifact_uri, "GWAS/summaries")
-#     
-#     try:
-#         summaries_fileinfo = [ os.path.join(gwas_dir_summaries, x) for x in  os.listdir(gwas_dir_summaries) ]
-#     except:
-#         summaries_fileinfo = []
-#     
-#     if len(summaries_fileinfo) == 0:
-#         return pd.DataFrame(columns=["run", "pheno", "region"])
-#     
-#     region_summaries = {get_phenoname(x): os.path.join(artifact_uri, x) for x in summaries_fileinfo}
-#     dfs = [pd.read_csv(path).assign(pheno=pheno) for pheno, path in region_summaries.items()]
-#     
-#     df = pd.concat(dfs)
-#     df['locus_name'] = df.apply(lambda row: REGION_TO_LOCUS.get(row["region"], "Unnamed"), axis=1)
-#     df = df.set_index(["pheno", "region"])    
-#     
-#     df_filtered = df[df.P < p_threshold]
-#     
-#     return df_filtered.sort_values(by="P")
-# 
-# 
-# def summarize_loci_across_runs(runs_df: pd.DataFrame):
-# 
-#     '''
-#     Parameters: run_ids
-#     Return: pd.DataFrame with .
-#     '''
-# 
-#     # run_ids = sorted([x[1] for x in runs_df[runs_df["metrics.test_recon_loss"] < RECON_LOSS_THRES].index])
-#     run_ids = sorted([x[1] for x in runs_df.index])
-# 
-#     all_signif_loci = []
-#     
-#     for run_id in tqdm(run_ids):
-#         signif_loci_df = \
-#             get_significant_loci(runs_df, experiment_id=1, run_id=run_id).\
-#             assign(run=run_id).\
-#             reset_index().\
-#             set_index(["run", "pheno", "region"]
-#         )                
-#         all_signif_loci.append(signif_loci_df)        
-#       
-#     all_signif_loci = pd.concat(all_signif_loci)    
-#     return all_signif_loci
-# 
-#     # df = all_signif_loci.\
-#     #   groupby(["region", "locus_name"]).\
-#     #   aggregate({"CHR":"count", "P": "min"}).\
-#     #   rename({"CHR":"count", "P":"min_P"}, axis=1).\
-#     #   sort_values("count", ascending=False)    
-#     # 
-#     # return df
+    def get_counts_per_chamber(self, p_threshold=5e-8):
+        return self.get_counts_per_attribute(p_threshold=p_threshold, attributes=["variable_type", "chamber"])
