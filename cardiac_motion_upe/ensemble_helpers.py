@@ -35,46 +35,90 @@ from loci_helpers import (
 import gwas_pipeline
 
 
-def generate_loci_summary(assocs_df, 
-    only_dynamic=False, 
-    only_static=False,     
-    # chamber=None, 
-    p_threshold=5e-8, 
-    other_columns=['chamber']):
+def summarize_loci_hits(
+    assocs_df,
+    p_threshold=5e-8,
+    groupby=["region", "run", "variable_type"],
+    collapse_attributes=None,
+    extra_columns=None
+):
+    """
+    Summarizes significant loci with P < p_threshold.
 
-    assocs_df = assocs_df.copy()
+    Parameters
+    ----------
+    assocs_df : pd.DataFrame
+        DataFrame containing GWAS association results.
+    p_threshold : float
+        Significance threshold for filtering loci.
+    groupby : list of str
+        Columns to group by in the initial summary.
+    collapse_attributes : list of str or None
+        If provided, perform a second aggregation grouped by these attributes.
+        Useful for collapsing across multiple runs or configurations.
+    extra_columns : list of str or None
+        Additional columns to include in the grouping (e.g., 'chamber').
 
-    # assert chamber in { None } | EnsembleGWASResults.possible_chambers, f"Chamber not valid, got {chamber}."
-    assert not (only_dynamic and only_static), "At most one of only_dynamic or only_static can be True."
-        
-    GROUPBY_COLS = ["region", "run", "variable_type"]
-    
-    # if "run" in assocs_df.columns:   
-        # GROUPBY_COLS.append("run")
-    # if "variable_type" in assocs_df.columns: 
-        # GROUPBY_COLS.append("variable_type")
-    GROUPBY_COLS.extend(other_columns)
-        
-    loci_summary_df = ( assocs_df
-        .query("P < @p_threshold")
-        .reset_index()
-        .groupby(by=GROUPBY_COLS)
-        .aggregate({"CHR": "count", "P": "min"}).rename({"CHR": "count", "P": "min_P"}, axis=1)
-        .reset_index()
-        .sort_values("count", ascending=False)
-        .sort_values("min_P", ascending=True) ) 
-    
-    if "variable_type" in loci_summary_df.columns:
-        if only_dynamic:
-            loci_summary_df.query("variable_type == 'dynamic'")  
-        elif only_static:
-            loci_summary_df.query("variable_type == 'static'")
+    Returns
+    -------
+    pd.DataFrame
+        Summary of significant loci per group, with columns:
+            - 'count': number of significant entries or grouped hits
+            - 'min_P': minimum p-value in the group
+    """
+    df = assocs_df.query("P < @p_threshold")
 
-    # Filter regions that are duplicated (according to the spreadsheet)
-    loci_summary_df = EnsembleGWASResults.filter_valid_regions(loci_summary_df)
-    # loci_summary_df.loc[[x in EnsembleGWASResults.valid_regions for x in loci_summary_df.index.get_level_values("region")]]
-    
-    return loci_summary_df
+    if extra_columns:
+        groupby = groupby + extra_columns
+
+    lead_snp_df = df.loc[df.groupby(groupby)["P"].idxmin()][groupby + ["SNP"]]
+    lead_snp_df = lead_snp_df.rename(columns={ "SNP": "lead_SNP" })
+
+    # Filter by significance threshold and group
+    agg_df = ( df.
+        groupby(groupby).
+        agg(
+            count=("CHR", "count"),            
+            min_P=("P", "min")).
+        reset_index()
+    )
+
+    summary_df = pd.merge(agg_df, lead_snp_df, on=groupby)
+
+    # Optional: collapse across runs or other attributes
+    if collapse_attributes:
+
+        ignore_columns = ["min_P", "count", "lead_SNP"] + collapse_attributes
+        groupby2 = summary_df.columns.difference( ignore_columns ).tolist()
+
+        assert all(attr in summary_df.columns for attr in collapse_attributes), (
+            f"Some collapse attributes not found: {set(collapse_attributes) - set(summary_df.columns)}"
+        )
+
+        # Find the best hit per group (across the collapse_attributes)        
+        cols = list(set(groupby) - set(collapse_attributes))
+        lead_snp = summary_df.loc[summary_df.groupby(cols)["min_P"].idxmin(), cols + ["lead_SNP"]]
+
+        summary_df = ( summary_df
+            .groupby(groupby2)
+            .agg({"count": "count", "min_P": "min"})
+            .reset_index()
+            .sort_values("count", ascending=False) )
+    else:
+        summary_df = summary_df.sort_values("count", ascending=False).sort_values("min_P", ascending=True)
+
+#    from IPython import embed; embed()
+    summary_df = summary_df.merge(lead_snp, on=cols)
+
+    # Optional filtering step for valid regions (if using EnsembleGWASResults class)
+    if hasattr(EnsembleGWASResults, "filter_valid_regions"):
+        summary_df = EnsembleGWASResults.filter_valid_regions(summary_df)
+
+    summary_df = summary_df.dropna()
+    summary_df = summary_df.assign(count=summary_df["count"].astype(int))
+
+    return summary_df
+
 
 
 class EnsembleGWASResults:
@@ -100,11 +144,12 @@ class EnsembleGWASResults:
     run_to_chamber_dict = dict()
     for k, v in run_to_expid_dict.items():
         run_to_chamber_dict[str(k)] = expid_to_partition_mapping[v]
+    del k, v
 
     loci_mapping_df = fetch_loci_mapping()
     valid_regions = loci_mapping_df.index[loci_mapping_df["duplicated"].isnull()]
     
-    possible_chambers = { "BV", "LV", "RV", "LA", "RA", "AO" }
+    possible_chambers = { "BV", "LV", "RV", "LA", "RA" } # , "AO" }
 
     RELEVANT_RUN_HPARAMS = [ "params.latent_dim_c", "params.latent_dim_s", "params.dataset_static_representative", "params.w_kl" ]
     RELEVANT_RUN_METRICS = [ "metrics.val_recon_loss_c", "metrics.val_recon_loss_s", "metrics.val_rec_ratio_to_time_mean" ]
@@ -220,29 +265,37 @@ class EnsembleGWASResults:
 
     @staticmethod
     def add_variable_type(df):
-        
-        # This is a way to determine whether we are dealing with latent variables
+                
         assert "pheno" in df.columns, "Column 'pheno' not found in the DataFrame. Available columns are {df.columns}"
-
-        if any(df.pheno.apply(lambda x: "z0" in x)):
+       
+        # This is a way to determine whether we are dealing with latent variables
+        is_latent_variable = lambda x: "z0" in x
+                
+        if any(df.pheno.apply(is_latent_variable)):
             logging.info(f"Assigning dynamic/static label to phenotypes...")
             try:
                 df["variable_type"] = df.apply(EnsembleGWASResults._get_variable_type, axis=1)
             except Exception as e:
-                logging.error(e)        
+                logging.error(e)
+                
         return df
     
 
     @staticmethod
     def add_is_variational_column(df):
-        
-        # This is a way to determine whether we are dealing with latent variables
+                
         assert 'params.w_kl' in df.columns, f"Column 'params.w_kl' not found in the DataFrame. Available columns are {df.columns}"
 
         return df.assign(is_variational=lambda df: df['params.w_kl'].astype(float) > 0)
+    
 
-
-    def filter_results(self, query, inplace=True):       
+    def filter_results(self, query, inplace=True):
+        
+        """
+        Filters the .region_assocs_df DataFrame according to the query. 
+        It uses the same syntax as pd.DataFrame.query
+        """
+        
         if inplace:
             self.region_assocs_df = self.region_assocs_df.query(query)
             return self.region_assocs_df
@@ -251,8 +304,14 @@ class EnsembleGWASResults:
         
 
     def count_runs(self):
+
+        """
+        Returns a DataFrame with the number of runs per "chamber", "static representative" and "is_variational".
+        """
+        
         return ( self.region_assocs_df.
-            drop_duplicates(subset=['run'], keep='first')[["chamber", "static_representative", "is_variational"]].
+            drop_duplicates(subset=['run'], keep='first').
+            loc[:, ["chamber", "static_representative", "is_variational"]].
             value_counts().
             to_frame().reset_index().
             pivot(columns=["static_representative", "is_variational"], index="chamber", values="count").
@@ -299,7 +358,7 @@ class EnsembleGWASResults:
             }, axis=1)
 
             if cache:
-                logging.info(f"Caching results to {self._rootdir}/region_assocs_df.pkl")
+                logging.info(f"Cache'ing results to {self._rootdir}/region_assocs_df.pkl")
                 region_assocs_df.to_pickle(f"{self._rootdir}/region_assocs_df.pkl")
     
             self.region_assocs_df = region_assocs_df
@@ -307,6 +366,10 @@ class EnsembleGWASResults:
 
              
     def keep_top_n_per_chamber(self, n, inplace=False):
+
+        """
+        Keeps the top n runs per chamber with the best reconstruction performance, as measured by the dynamic mean squared deviation.
+        """
         
         rec_losses = []
         
@@ -316,7 +379,6 @@ class EnsembleGWASResults:
             logging.info(f"Chamber {chamber}: Keeping {len(unique_values)} runs with the best performance.")
             rec_losses.extend(unique_values)
         
-        # rec_losses = set(rec_losses)
         if inplace:
             logging.info(f"Only the best (at most) {n} runs per chamber with the best performance will be kept. Filtering...")
             self.region_assocs_df = self.region_assocs_df[self.region_assocs_df.msd_dynamic.apply(lambda x: x in rec_losses)]
@@ -337,52 +399,38 @@ class EnsembleGWASResults:
 
     @staticmethod
     def filter_valid_regions(df):
-        print(f"{df.shape=}")
+        
+        """
+        Filters out regions that are duplicated in the spreadsheet
+        """
+        
         if "region" in df.columns:
             df_filtered = df.where(df.region.isin(EnsembleGWASResults.valid_regions))
             return df_filtered
-        # return df.loc[[x in EnsembleGWASResults.valid_regions for x in df.index.get_level_values("region")]]
+        else:
+            logging.error(f"Column 'region' not found in the DataFrame. Available columns are {df.columns}")
+            return df
 
-
-    def loci_count(self, p_threshold=5e-8, attributes=['chamber']):
-        
-        loci_summary_df = generate_loci_summary(self.region_assocs_df, p_threshold=p_threshold) # self.loci_summary(p_threshold=p_threshold, )
-        
-        assert all([attributes in loci_summary_df.columns for attributes in attributes]), f"""
-            Columns {set(attributes) - set(loci_summary_df.columns)} not found in the DataFrame.
-            Columns are {loci_summary_df.columns.to_list()}.
-        """
-
-        ( GROUPBY_COLS := ["region", "variable_type"] ).extend( attributes )
-
-        assert set(GROUPBY_COLS).issubset(loci_summary_df.columns), f"""
-            Columns {set(GROUPBY_COLS) - set(loci_summary_df.columns)} not found in the DataFrame.
-            Columns are {loci_summary_df.columns.to_list()}.
-        """ 
-        
-        loci_count_df = ( loci_summary_df.
-            groupby(GROUPBY_COLS).
-            aggregate({"count":"count", "min_P": "min"}).
-            rename({"CHR":"count", "P":"min_P"}, axis=1).
-            sort_values("count", ascending=False) )
-            
-        return loci_count_df
-    
     
     def show_counts(self, count_thr = 5, pvalue_thr=1.5e-10):
         region_count_df = self.loci_count()
         # display( region_count_df.query("count >= @count_thr or min_p < @pvalue_thr") )
         display( region_count_df[(region_count_df["count"] >= count_thr) | (region_count_df.min_P < pvalue_thr)])
           
-    
+
+    def summarize_loci_hits(self, p_threshold=5e-8, groupby=["region", "run", "variable_type"], collapse_attributes=None, extra_columns=None):
+        __doc__ = summarize_loci_hits.__doc__
+
+        return summarize_loci_hits(self.region_assocs_df, p_threshold=p_threshold, groupby=groupby, collapse_attributes=collapse_attributes, extra_columns=extra_columns)
+
+
     def get_results_for_region(self, region, top_n=20, only_dynamic=False, only_static=False, exp_ids=None):
     
         def color_negative_red(val):
             color = 'red' if val < 0 else 'black'
             return 'color: %s' % color
         
-        df = self.region_assocs_df[self.region_assocs_df.region == region].sort_values("P").head(top_n)
-        # df = region_assocs_df.iloc[region_assocs_df.index.get_level_values("region") == region,].sort_values("P").head(15)
+        df = self.region_assocs_df.query("region == @region").sort_values("P").head(top_n)
         df.style.background_gradient(cmap='Blues')
         df.style.set_properties(**{'text-align': 'center'}).set_table_styles([{
           'selector': 'th',
@@ -404,37 +452,26 @@ class EnsembleGWASResults:
         return df
     
     
-    def get_suggestive_regions(self):
+    @staticmethod
+    def get_suggestive_regions(counts_df, GW_P_THRESHOLD=5e-8, COUNT_THRESHOLD=1, SW_P_THRESHOLD=1.5e-10):
         
-        region_count_df = self.loci_count()
-        suggestive_regions = sorted(
-            region_count_df[
-                ((region_count_df.min_P < 5e-8) & (region_count_df["count"] >= 1)) &
-                (region_count_df.min_P > 1.5e-10)
-            ].index.get_level_values("region")
-        )
-        
+        # region_count_df = self.loci_count()
+        sugg_condition = ((counts_df.min_P < GW_P_THRESHOLD) & (counts_df['count'] >= COUNT_THRESHOLD)) & (counts_df.min_P > SW_P_THRESHOLD)
+        suggestive_regions = sorted(counts_df[sugg_condition]['region'])
         suggestive_regions = list(set(suggestive_regions))
-
         return suggestive_regions
             
-        
-    def get_significant_regions(self):
+    
+    @staticmethod
+    def get_significant_regions(counts_df, GW_P_THRESHOLD=5e-8, COUNT_THRESHOLD=5, SW_P_THRESHOLD=1.5e-10):
 
-        region_count_df = self.loci_count()
-        significant_regions = sorted(
-            region_count_df[
-                ((region_count_df.min_P < 5e-8) & (region_count_df["count"] >= 5)) |
-                (region_count_df.min_P < 1.5e-10)
-            ].index.get_level_values("region")
-        )
-        
+        signif_condition = ((counts_df.min_P < GW_P_THRESHOLD) & (counts_df['count'] >= COUNT_THRESHOLD)) | (counts_df.min_P < SW_P_THRESHOLD)
+        significant_regions = sorted(counts_df[signif_condition]['region'])
         significant_regions = list(set(significant_regions))
         return significant_regions
     
 
-    @classmethod
-    def create_count_table_tex(counts_df, tex_file=None):
+    def create_count_table_tex(self, counts_df, tex_file=None, caption=None, label=None):
         
         '''
           Generates a LaTeX table for significant loci.
@@ -447,80 +484,101 @@ class EnsembleGWASResults:
 
         assert "min_P" in counts_df.columns, "'min_P' column is missing"
 
-        regions   = self.get_significant_regions()
-        snp_data  = self._snp_data()
+        # regions   = self.get_significant_regions(counts_df)
+        snp_data  = self._snp_data()        
     
-        build_pvalue_str = lambda x: f"${round(float(x[0]), 1)} \\times 10^{{{x[1]}}}$"
-        build_region_str = lambda region: f'{EnsembleGWASResults.regions_df.loc[region, "start"]}-{EnsembleGWASResults.regions_df.loc[region, "stop"]}'
-        build_eaf_pctg_str    = lambda x: f"{(100*x):.1f}"
-        region_to_candidate_gene = lambda gene: self.loci_mapping_df.loc[gene, "candidate_gene"]
-        chromosome_from_region = lambda region: EnsembleGWASResults.regions_df.loc[region, "chr"] 
+        build_pvalue_str         = lambda x:      f"${round(float(x[0]), 1)} \\times 10^{{{x[1]}}}$"
+        build_region_str         = lambda region: f'{EnsembleGWASResults.regions_df.loc[region, "start"]}-{EnsembleGWASResults.regions_df.loc[region, "stop"]}'
+        build_eaf_pctg_str       = lambda eaf:    f"{(100*eaf):.1f}"
+        region_to_candidate_gene = lambda gene:   self.loci_mapping_df.loc[gene, "candidate_gene"]
+        chromosome_from_region   = lambda region: EnsembleGWASResults.regions_df.loc[region, "chr"] 
 
-        counts_df = counts_df.loc[regions]
-        counts_df = counts_df.assign(min_P=counts_df["min_P"].astype(str).str.split("e").apply(build_pvalue_str))
-        counts_df = counts_df.reset_index()
-        counts_df = counts_df.assign(candidate_gene=counts_df["region"].map(region_to_candidate_gene))
-        counts_df = counts_df.assign(chr= counts_df.region.map(chromosome_from_region))
-        counts_df = counts_df.merge(snp_data, on="region")
-        counts_df = counts_df.assign(region=counts_df["region"].map(build_region_str))
-        counts_df = counts_df.sort_values("count", ascending=False)
-
-        counts_df = counts_df[["chr", "region", "candidate gene", "count", "min_P", "SNP", "a_0", "a_1", "AF", "BETA", "SE"]]
-        counts_df = counts_df.rename(columns={"chr": "chr.", "min_P": "min. $p$-value", "a_0": "NEA", "a_1": "EA", "AF": "EAF"})
-        counts_df = counts_df.assign(EAF=counts_df.EAF.apply(build_eaf_str))
+        counts_df = ( counts_df.
+            assign(
+                min_P=lambda df: df["min_P"].astype(str).str.split("e").apply(build_pvalue_str),
+                candidate_gene=lambda df: df["region"].map(region_to_candidate_gene),
+                chr=lambda df: df["region"].map(chromosome_from_region),
+                region=lambda df: df["region"].map(build_region_str)).
+            merge(snp_data.drop("region", axis=1), left_on="lead_SNP", right_on="SNP").
+            sort_values("count", ascending=False).
+            loc[:, ["chr", "region", "candidate_gene", "count", "min_P", "SNP", "a_0", "a_1", "AF", "BETA", "SE"]].
+            rename(columns={
+                "chr": "chr.",
+                "min_P": "min. $p$-value",
+                "a_0": "NEA",
+                "a_1": "EA",
+                "AF": "EAF",
+                "candidate_gene": "candidate gene"
+            }).
+            assign(EAF=lambda df: df["EAF"].apply(build_eaf_pctg_str))
+        )
     
         assert not counts_df.empty, "counts_df is empty after filtering"        
-        assert hasattr(cls, 'loci_mapping_df'), "'loci_mapping_df' attribute is missing in the class"
+        assert hasattr(self, 'loci_mapping_df'), "'loci_mapping_df' attribute is missing in the class"
 
         scale_beta = counts_df["BETA"].abs().between(0.01, 0.2).all()
     
         if scale_beta:
-            counts_df["BETA"] = (counts_df["BETA"] * 100).round(3)
-            counts_df["SE"] = (counts_df["SE"] * 100).round(3)
+            counts_df["BETA"] = (counts_df["BETA"] * 100).round(2)
+            counts_df["SE"] = (counts_df["SE"] * 100).round(2)
             beta_header = r"$\hat{\beta} \pm \text{se}(\hat{\beta})(\times 100)$ "
         else:
-            counts_df["BETA"] = counts_df["BETA"].round(3)
-            counts_df["SE"] = counts_df["SE"].round(3)
+            counts_df["BETA"] = counts_df["BETA"].round(2)
+            counts_df["SE"] = counts_df["SE"].round(2)
             beta_header = r"$\hat{\beta} \pm \text{se}(\hat{\beta})$"
     
         counts_df["BETA_SE"] = counts_df.apply(lambda row: f"${row['BETA']} \pm {row['SE']}$", axis=1)
         counts_df = counts_df.drop(columns=["BETA", "SE"])
     
-        table_code = counts_df.to_latex(
+        table_code_inner = counts_df.to_latex(
             escape=False,
             index=False,
-            column_format="rllrllllr",
-            caption="GWAS Results"
+            column_format="rccccccccc"
         )
-    
-        table_code = table_code.replace("_", "\\_").replace("BETA\_SE", beta_header)
-    
+
+        # Optional label + caption
+        table_label = r"\label{table:gwas_cardiac_motion}"
+        table_caption = r"\caption{GWAS summary statistics for cardiac motion phenotypes.}"
+
+        # Clean column name
+        table_code_inner = table_code_inner.replace("_", r"\_").replace("BETA\_SE", beta_header)
+
+        # Wrap in table* + adjustbox
+        table_code = (
+            r"\begin{table*}" "\n"
+            r"\begin{adjustbox}{width=\textwidth}%" "\n"
+            r"\centering" "\n"
+            + table_code_inner.strip() + "\n"
+            r"\end{adjustbox}" "\n"
+            + f"\\label{{{label}}}\n"
+            + f"\\caption{{{caption}}}\n"
+            r"\end{table*}"
+        )
+
         if tex_file is not None:
             print(f"Creating output file in {tex_file}")
             with open(tex_file, "wt") as table_f:
                 table_f.write(table_code)
-    
+
         return table_code
 
     
     def _snp_data(self):
         
-        region_assocs_df = self.region_assocs_df.copy()
-        region_assocs_df = region_assocs_df.loc[~region_assocs_df.sort_values("SNP").duplicated("SNP")]
-        signif_regions = set(self.get_significant_regions())
-        region_assocs_df = region_assocs_df.reset_index()
-        rows_signif_regions = region_assocs_df.apply(lambda row: row.region in signif_regions, axis=1)
+        if not hasattr(self, "snp_data"):
+            region_assocs_df = self.region_assocs_df.copy()
+            snp_data = region_assocs_df.loc[~region_assocs_df.sort_values("SNP").duplicated("SNP")]
+            snp_data = snp_data.loc[:,["region", "SNP", "BP", "AF", "a_0", "a_1", "BETA", "SE"]]
+            self.snp_data = snp_data
+        return self.snp_data
         
-        region_assocs_df = region_assocs_df[rows_signif_regions]
-        region_assocs_df = region_assocs_df[region_assocs_df.P < 5e-8]
-        
-        snp_data = region_assocs_df.loc[:,["region", "SNP", "BP", "AF", "a_0", "a_1", "BETA", "SE"]]
-        return snp_data
-    
     
     def assocs_per_variable_type(self, type="d"):
         
-        by_variable_type_df = results.loci_count()[["min_P"]].reset_index().pivot(index="region", columns="variable_type", values="min_P")
+        by_variable_type_df = ( results.loci_count()[["min_P"]].
+            reset_index().
+            pivot(index="region", columns="variable_type", values="min_P")
+        )
         
         if type == "d":
             return by_variable_type_df.sort_values("dynamic")
@@ -535,13 +593,18 @@ class EnsembleGWASResults:
         idx_min = self.region_assocs_df.groupby("region").P.idxmin()
         idx_min = idx_min[self.get_significant_regions()]        
         
-        return self.region_assocs_df.iloc[idx_min][["CHR", "BP", "region", "SNP", "AF", "P"]].\
-            reset_index(drop=True).\
-            sort_values(["CHR", "region"]).\
-            sort_values(["CHR", "BP"])
+        return ( self.region_assocs_df.
+            iloc[idx_min].
+            loc[:, ["CHR", "BP", "region", "SNP", "AF", "P"]].
+            reset_index(drop=True).
+            sort_values(["CHR", "region"]).
+            sort_values(["CHR", "BP"]) ) 
 
 
     def get_counts_per_attribute(self, p_threshold=5e-8, attributes=["variable_type"]):
+        
+        """
+        """
         
         COL_ORDER = [(variable_type, chamber) for variable_type in ["dynamic", "static"] for chamber in ["BV", "LV", "RV", "LA", "RA"]]        
 
@@ -551,17 +614,17 @@ class EnsembleGWASResults:
             fillna(0).astype(int)
         
         COL_ORDER = [ indices for indices in COL_ORDER if indices in counts_by_attribute.columns ]
-        counts_by_attribute = counts_by_attribute[COL_ORDER]
-        
+
+        counts_by_attribute  = counts_by_attribute[COL_ORDER]
         ordered_by_dynamic   = counts_by_attribute["dynamic"].sum(axis=1).sort_values(ascending=False).index
         total_counts_dynamic = counts_by_attribute.loc[ordered_by_dynamic]["dynamic"].sum(axis=1)
         total_counts_static  = counts_by_attribute.loc[ordered_by_dynamic]["static"].sum(axis=1)
         
         ratio_dyn_to_stat = (total_counts_dynamic - total_counts_static) / (total_counts_dynamic + total_counts_static)
-        possible_order = (ratio_dyn_to_stat[(total_counts_dynamic+total_counts_static) > 3]).sort_values(ascending=False).index
+        possible_order    = (ratio_dyn_to_stat[(total_counts_dynamic+total_counts_static) > 3]).sort_values(ascending=False).index
         
         counts_by_attribute = counts_by_attribute.loc[possible_order]
-        counts_by_attribute.index = [self.loci_mapping_df.loc[region, "candidate_gene"] for region in counts_by_attribute.index]
+        counts_by_attribute.index = [ self.loci_mapping_df.loc[region, "candidate_gene"] for region in counts_by_attribute.index ]
         
         return counts_by_attribute
 
